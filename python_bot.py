@@ -1,93 +1,182 @@
-import os, time, re, random, sqlite3, logging
+from __future__ import annotations
+
+import os
+import re
+import time
+import random
+import logging
+import sqlite3
 from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Tuple
+
 import telebot
-import openai
 from fpdf import FPDF
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
-log = logging.getLogger(__name__)
+USE_HF = os.getenv("USE_LOCAL_SUMMARY") == "1"
+if USE_HF:
+    from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+else:
+    import openai
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+)
+log = logging.getLogger("summarybot")
 
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not BOT_TOKEN or not OPENAI_API_KEY:
-    raise RuntimeError("BOT_TOKEN or OPENAI_API_KEY missing")
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-openai.api_key = OPENAI_API_KEY
 
-DB_PATH = "chat_history.db"
+@dataclass(frozen=True, slots=True)
+class Config:
+    token: str = os.getenv("BOT_TOKEN", "")
+    openai_key: str | None = os.getenv("OPENAI_API_KEY")
+    db_path: str = os.getenv("DB_PATH", "chat_history.db")
+    model_name: str = os.getenv("HF_MODEL_NAME", "facebook/bart-large-cnn")
 
-def init_db():
-    with closing(sqlite3.connect(DB_PATH)) as c, c, c.cursor() as cur:
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, chat_id INTEGER, user_id INTEGER, username TEXT, text TEXT, ttype TEXT, ts INTEGER)"
-        )
+    @property
+    def use_openai(self) -> bool:
+        return bool(self.openai_key)
 
-def save_msg(chat_id, user_id, username, text, ttype, ts):
-    with closing(sqlite3.connect(DB_PATH)) as c, c, c.cursor() as cur:
-        cur.execute(
-            "INSERT INTO messages (chat_id, user_id, username, text, ttype, ts) VALUES (?,?,?,?,?,?)",
-            (chat_id, user_id, username, text, ttype, ts),
-        )
 
-def load_msgs(chat_id, hours):
-    now = int(time.time())
-    start = now - hours * 3600
-    with closing(sqlite3.connect(DB_PATH)) as c, c, c.cursor() as cur:
-        cur.execute(
-            "SELECT username, text, ttype FROM messages WHERE chat_id=? AND ts BETWEEN ? AND ? ORDER BY ts",
-            (chat_id, start, now),
-        )
-        return cur.fetchall()
+CFG = Config()
+if not CFG.token:
+    raise RuntimeError("BOT_TOKEN not provided")
+if not CFG.use_openai and not USE_HF:
+    raise RuntimeError("No summarization backend")
+if CFG.use_openai:
+    openai.api_key = CFG.openai_key
 
-url_re = re.compile(r"http[s]?://\S+")
-
-def clean(text):
-    if not text:
-        return ""
-    text = url_re.sub("", text)
-    return re.sub(r"[^\w\s,.!?]", "", text).strip()
-
-def gpt(prompt, max_tokens, temp):
-    r = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens,
-        temperature=temp,
+class HistoryStore:
+    _schema = (
+        "CREATE TABLE IF NOT EXISTS messages ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "chat_id INTEGER, user_id INTEGER, username TEXT,"
+        "body TEXT, mtype TEXT, ts INTEGER)"
     )
-    return r.choices[0].message.content.strip()
 
-def make_summary(history):
-    parts = [f"{u}: {clean(t)}" for u, t, tp in history if tp == "text" and clean(t)]
-    if not parts:
-        return "No text messages."
-    prompt = "Summarize this group chat:\n\n" + "\n".join(parts)
-    return gpt(prompt, 1200, 0.6)
+    def __init__(self, db_file: str):
+        self._db = db_file
+        self._init()
 
-def make_comic(summary):
-    prompt = "Describe a 3‑panel comic for this summary:\n\n" + summary
-    return gpt(prompt, 400, 0.8)
+    def _connect(self):
+        return sqlite3.connect(self._db, check_same_thread=False)
 
-def panel_img(n):
-    img = Image.new("RGB", (300, 200), (random.randint(0,255), random.randint(0,255), random.randint(0,255)))
+    def _init(self):
+        with closing(self._connect()) as conn, conn, conn.cursor() as cur:
+            cur.execute(self._schema)
+
+    def add(self, chat: int, user: int, uname: str, body: str, mtype: str, ts: int):
+        with closing(self._connect()) as conn, conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (chat_id,user_id,username,body,mtype,ts) VALUES (?,?,?,?,?,?)",
+                (chat, user, uname, body, mtype, ts),
+            )
+
+    def fetch(self, chat: int, hours: int) -> Iterable[Tuple[str, str, str]]:
+        end = int(time.time())
+        start = end - hours * 3600
+        with closing(self._connect()) as conn, conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT username, body, mtype FROM messages WHERE chat_id=? AND ts BETWEEN ? AND ? ORDER BY ts",
+                (chat, start, end),
+            )
+            yield from cur.fetchall()
+
+
+store = HistoryStore(CFG.db_path)
+
+class Summarizer:
+    url_re = re.compile(r"http[s]?://\\S+")
+    junk_re = re.compile(r"[^\\w\\s,.!?]")
+
+    @staticmethod
+    def _clean(txt: str) -> str:
+        txt = Summarizer.url_re.sub("", txt)
+        return Summarizer.junk_re.sub("", txt).strip()
+
+    def run(self, history: Iterable[Tuple[str, str, str]]) -> str:
+        raise NotImplementedError
+
+
+class OpenAISummarizer(Summarizer):
+    def run(self, history):
+        bodies = [
+            f"{u}: {self._clean(t)}"
+            for u, t, tp in history
+            if tp == "text" and self._clean(t)
+        ]
+        if not bodies:
+            return "No text messages."
+        prompt = "Summarize this group chat:\\n\\n" + "\\n".join(bodies)
+        resp = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1200,
+            temperature=0.6,
+        )
+        return resp.choices[0].message.content.strip()
+
+
+class LocalSummarizer(Summarizer):
+    def __init__(self, model_name: str):
+        tok = AutoTokenizer.from_pretrained(model_name)
+        mdl = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        self._pipe = pipeline("summarization", model=mdl, tokenizer=tok)
+
+    def run(self, history):
+        text = "\\n".join(
+            f"{u}: {self._clean(t)}"
+            for u, t, tp in history
+            if tp == "text" and self._clean(t)
+        )
+        if not text:
+            return "No text messages."
+        out = []
+        for i in range(0, len(text), 3500):
+            chunk = text[i : i + 3500]
+            s = self._pipe(chunk, max_new_tokens=130, do_sample=False)[0][
+                "summary_text"
+            ].strip()
+            out.append(s)
+        return self._pipe(" ".join(out), max_new_tokens=150, do_sample=False)[0][
+            "summary_text"
+        ].strip()
+
+
+summarizer: Summarizer = (
+    LocalSummarizer(CFG.model_name) if USE_HF else OpenAISummarizer()
+)
+
+def _panel_stub(n: int) -> Path:
+    img = Image.new(
+        "RGB",
+        (300, 200),
+        (
+            random.randint(0, 255),
+            random.randint(0, 255),
+            random.randint(0, 255),
+        ),
+    )
     d = ImageDraw.Draw(img)
     try:
-        f = ImageFont.truetype("arial.ttf", 24)
-    except IOError:
-        f = ImageFont.load_default()
-    d.text((10, 80), f"Panel {n}", (0,0,0), f)
-    path = f"panel_{n}.png"
-    img.save(path)
-    return path
+        font = ImageFont.truetype("arial.ttf", 24)
+    except OSError:
+        font = ImageFont.load_default()
+    d.text((10, 80), f"Panel {n}", fill=(0, 0, 0), font=font)
+    fn = Path(f"panel_{n}.png")
+    img.save(fn)
+    return fn
 
-def pdf_file(summary, comic, chat_id, hours):
+def build_pdf(summary: str, comic: str, chat_id: int, hrs: int) -> Path:
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, f"Summary {hours}h", ln=True, align="C")
+    pdf.cell(0, 10, f"Summary {hrs}h", ln=True, align="C")
     pdf.set_font("Arial", size=12)
     pdf.multi_cell(0, 8, summary)
     pdf.ln(4)
@@ -97,54 +186,68 @@ def pdf_file(summary, comic, chat_id, hours):
     pdf.multi_cell(0, 8, comic)
     pdf.ln(4)
     for i in range(1, 4):
-        p = panel_img(i)
-        pdf.image(p, w=60)
-        os.remove(p)
-    name = f"summary_{chat_id}_{int(time.time())}.pdf"
-    pdf.output(name)
-    return name
+        p = _panel_stub(i)
+        pdf.image(str(p), w=60)
+        p.unlink()
+    out = Path(f"summary_{chat_id}_{int(time.time())}.pdf")
+    pdf.output(str(out))
+    return out
 
-@bot.message_handler(content_types=["text", "photo", "sticker", "video", "document", "audio"])
-def all_msgs(m):
-    if m.chat.type in ("group", "supergroup"):
-        u = m.from_user.username or m.from_user.first_name or "user"
-        save_msg(m.chat.id, m.from_user.id, u, m.text or m.caption or "", m.content_type, m.date)
+tg = telebot.TeleBot(CFG.token, parse_mode="HTML")
 
-@bot.message_handler(commands=["summary"])
-def cmd_sum(m):
-    if m.chat.type not in ("group", "supergroup"):
-        bot.reply_to(m, "Group only.")
+@tg.message_handler(content_types=["text", "photo", "sticker", "video", "document", "audio"])
+def _collector(msg):
+    if msg.chat.type in {"group", "supergroup"}:
+        uname = msg.from_user.username or msg.from_user.first_name or "anon"
+        body = msg.text or msg.caption or ""
+        store.add(
+            msg.chat.id,
+            msg.from_user.id,
+            uname,
+            body,
+            msg.content_type,
+            msg.date,
+        )
+
+@tg.message_handler(commands=["summary"])
+def _summary_cmd(msg):
+    if msg.chat.type not in {"group", "supergroup"}:
+        tg.reply_to(msg, "Group only.")
         return
     try:
-        h = int(m.text.split()[1])
+        hrs = int(msg.text.split()[1])
+        if not 1 <= hrs <= 24:
+            raise ValueError
     except (IndexError, ValueError):
-        bot.reply_to(m, "Usage: /summary <1‑24>")
+        tg.reply_to(msg, "Usage: /summary <1-24>")
         return
-    if not 1 <= h <= 24:
-        bot.reply_to(m, "1‑24 only.")
-        return
-    bot.reply_to(m, "Working…")
-    hist = load_msgs(m.chat.id, h)
+    tg.reply_to(msg, "Working…")
+    hist = list(store.fetch(msg.chat.id, hrs))
     if not hist:
-        bot.reply_to(m, "No messages.")
+        tg.reply_to(msg, "No messages.")
         return
-    s = make_summary(hist)
-    c = make_comic(s)
-    pdf = pdf_file(s, c, m.chat.id, h)
-    bot.send_message(m.chat.id, s)
-    with open(pdf, "rb") as f:
-        bot.send_document(m.chat.id, f, caption=f"{h}h summary")
-    os.remove(pdf)
+    summ = summarizer.run(hist)
+    comic = (
+        "Comic description disabled (offline)"
+        if not CFG.use_openai
+        else "Comic placeholder"
+    )
+    pdf_path = build_pdf(summ, comic, msg.chat.id, hrs)
+    tg.send_message(msg.chat.id, summ)
+    with pdf_path.open("rb") as f:
+        tg.send_document(msg.chat.id, f, caption=f"{hrs}h summary")
+    pdf_path.unlink()
 
-@bot.message_handler(commands=["start", "help"])
-def cmd_start(m):
-    bot.reply_to(m, "Add me to a group and use /summary <hours>.")
+@tg.message_handler(commands=["start", "help"])
+def _start(msg):
+    tg.reply_to(msg, "Add me to a group and use /summary <hours>.")
 
 if __name__ == "__main__":
-    init_db()
+    Path(CFG.db_path).parent.mkdir(parents=True, exist_ok=True)
     while True:
         try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=30)
-        except Exception as e:
-            log.error("restart: %s", e)
+            log.info("Polling…")
+            tg.infinity_polling(timeout=30, long_polling_timeout=30)
+        except Exception as exc:
+            log.error("polling error: %s", exc)
             time.sleep(5)
